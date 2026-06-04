@@ -47,7 +47,7 @@ class AppLogic:
                         on_progress(idx, total, item.name)
                     
                     fmt = item.format
-                    qual = 100 if item.convert_only else item.quality
+                    qual = item.effective_quality()
                     name_without_ext = os.path.splitext(item.name)[0]
                     ext = '.' + fmt.lower()
                     out_name = AppLogic._get_unique_filename(f"{name_without_ext}{ext}", used_names)

@@ -64,5 +64,50 @@ class TestImageUtils(unittest.TestCase):
         loaded_img = image_utils.load_image_from_url("http://example.com/test.png")
         self.assertEqual(loaded_img.size, (100, 100))
 
+    @patch('requests.get')
+    def test_load_image_from_html_og_image(self, mock_get):
+        img_byte_arr = io.BytesIO()
+        self.img.save(img_byte_arr, format='PNG')
+
+        html_response = MagicMock()
+        html_response.status_code = 200
+        html_response.headers = {'Content-Type': 'text/html; charset=utf-8'}
+        html_response.url = 'https://share.google/demo'
+        html_response.text = '<html><head><meta property="og:image" content="https://cdn.example.com/p.png"></head></html>'
+
+        image_response = MagicMock()
+        image_response.status_code = 200
+        image_response.headers = {'Content-Type': 'image/png'}
+        image_response.content = img_byte_arr.getvalue()
+
+        mock_get.side_effect = [html_response, image_response]
+
+        loaded_img = image_utils.load_image_from_url('https://share.google/demo')
+        self.assertEqual(loaded_img.size, (100, 100))
+        self.assertEqual(mock_get.call_count, 2)
+
+    @patch('requests.get')
+    def test_load_image_from_html_img_src_relative(self, mock_get):
+        img_byte_arr = io.BytesIO()
+        self.img.save(img_byte_arr, format='PNG')
+
+        html_response = MagicMock()
+        html_response.status_code = 200
+        html_response.headers = {'Content-Type': 'text/html'}
+        html_response.url = 'https://example.com/share/page'
+        html_response.text = '<html><body><img src="/assets/image.png"></body></html>'
+
+        image_response = MagicMock()
+        image_response.status_code = 200
+        image_response.headers = {'Content-Type': 'image/png'}
+        image_response.content = img_byte_arr.getvalue()
+
+        mock_get.side_effect = [html_response, image_response]
+
+        loaded_img = image_utils.load_image_from_url('https://example.com/share/page')
+        self.assertEqual(loaded_img.size, (100, 100))
+        called_url = mock_get.call_args_list[1][0][0]
+        self.assertEqual(called_url, 'https://example.com/assets/image.png')
+
 if __name__ == '__main__':
     unittest.main()

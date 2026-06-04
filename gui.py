@@ -364,7 +364,7 @@ class ImageCompressorApp:
             self.btn_delete.configure(state="disabled")
             self.btn_undo.configure(state="disabled")
             self.quality_scale.configure(state="disabled")
-        self.btn_batch.configure(state="normal")
+        self.btn_batch.configure(state="normal" if self.items else "disabled")
 
     def process_image(self):
         if self.current_index is None:
@@ -377,26 +377,46 @@ class ImageCompressorApp:
             self.process_after_id = None
 
         try:
-            # 應用浮水印 (如果啟用)
-            img_to_compress = item.original_pil
-            if item.watermark.enabled:
-                img_to_compress = image_utils.apply_watermark(item.original_pil.copy(), item.watermark)
+            process_key = item.build_process_key()
 
-            # 如果是僅轉檔，則使用最高品質 (100)
-            effective_quality = 100 if item.convert_only else item.quality
-            buffer, size = image_utils.compress_image_to_buffer(img_to_compress, item.format, effective_quality)
-            item.compressed_size = size
-            compressed_img = Image.open(buffer)
-            compressed_img.load()
-            item.compressed_pil = compressed_img.copy()
+            if process_key == item.last_process_key and item.preview_before and item.preview_after:
+                self.update_canvas()
+                self.update_info_label()
+                return
 
-            # 更新預覽縮圖
-            item.preview_before, item.img_width, item.img_height = image_utils.resize_image_contain(
-                item.original_pil, constants.MAX_PREVIEW_WIDTH, constants.MAX_PREVIEW_HEIGHT
-            )
-            
+            cached = item.get_cached_process(process_key)
+            if cached is not None:
+                cached_img, cached_size = cached
+                item.compressed_pil = cached_img.copy()
+                item.compressed_size = cached_size
+            else:
+                # 應用浮水印 (如果啟用)
+                img_to_compress = item.original_pil
+                if item.watermark.enabled:
+                    img_to_compress = image_utils.apply_watermark(item.original_pil.copy(), item.watermark)
+
+                buffer, size = image_utils.compress_image_to_buffer(
+                    img_to_compress,
+                    item.format,
+                    item.effective_quality(),
+                )
+                item.compressed_size = size
+                with Image.open(buffer) as compressed_img:
+                    item.compressed_pil = compressed_img.copy()
+                item.set_cached_process(process_key, item.compressed_pil, size)
+
+            source_id = id(item.original_pil)
+            if getattr(item, "preview_source_id", None) != source_id or item.preview_before is None:
+                item.preview_before, item.img_width, item.img_height = image_utils.resize_image_contain(
+                    item.original_pil, constants.MAX_PREVIEW_WIDTH, constants.MAX_PREVIEW_HEIGHT
+                )
+                item.preview_source_id = source_id
+                item.clear_canvas_cache()
+
             # 確保壓縮後的預覽圖大小一致
             item.preview_after = item.compressed_pil.resize((item.img_width, item.img_height), Image.Resampling.LANCZOS)
+            item.clear_canvas_cache()
+            item.last_process_key = process_key
 
             if item.slider_x is None:
                 item.slider_x = item.img_width // 2
@@ -420,13 +440,17 @@ class ImageCompressorApp:
         val = int(float(value))
         self.quality_label.configure(text=str(val))
         if self.current_index is not None:
-            self.items[self.current_index].quality = val
-            self.schedule_process_image()
+            item = self.items[self.current_index]
+            if item.quality != val:
+                item.quality = val
+                self.schedule_process_image()
 
     def on_convert_only_change(self):
         if self.current_index is not None:
             is_convert_only = self.convert_only_var.get()
-            self.items[self.current_index].convert_only = is_convert_only
+            item = self.items[self.current_index]
+            changed = item.convert_only != is_convert_only
+            item.convert_only = is_convert_only
             
             # 同步禁用品質滑桿
             if is_convert_only:
@@ -434,12 +458,16 @@ class ImageCompressorApp:
             else:
                 self.quality_scale.configure(state="normal")
                 
-            self.schedule_process_image()
+            if changed:
+                self.schedule_process_image()
 
     def on_format_change(self, event=None):
         if self.current_index is not None:
-            self.items[self.current_index].format = self.format_var.get()
-            self.schedule_process_image()
+            item = self.items[self.current_index]
+            new_format = self.format_var.get()
+            if item.format != new_format:
+                item.format = new_format
+                self.schedule_process_image()
 
     def toggle_crop_mode(self):
         self.crop_mode = not self.crop_mode
@@ -1023,9 +1051,20 @@ class ImageCompressorApp:
         self.canvas.delete("all")
         w, h = int(item.img_width * self.zoom_level), int(item.img_height * self.zoom_level)
         resample_method = Image.Resampling.NEAREST if self.zoom_level > 1 else Image.Resampling.LANCZOS
-        
-        zoomed_before = item.preview_before.resize((w, h), resample_method)
-        zoomed_after = item.preview_after.resize((w, h), resample_method)
+        cache_key = (
+            id(item.preview_before),
+            id(item.preview_after),
+            w,
+            h,
+            1 if self.zoom_level > 1 else 0,
+        )
+        if item.canvas_cache_key != cache_key or item.canvas_cache_before is None or item.canvas_cache_after is None:
+            item.canvas_cache_before = item.preview_before.resize((w, h), resample_method)
+            item.canvas_cache_after = item.preview_after.resize((w, h), resample_method)
+            item.canvas_cache_key = cache_key
+
+        zoomed_before = item.canvas_cache_before
+        zoomed_after = item.canvas_cache_after
         
         self.tk_img_before = ImageTk.PhotoImage(zoomed_before)
         self.canvas.create_image(0, 0, anchor="nw", image=self.tk_img_before)
@@ -1121,14 +1160,12 @@ class ImageCompressorApp:
         path = filedialog.asksaveasfilename(defaultextension=ext_map.get(item.format, ".jpg"), filetypes=[(item.format, f"*{ext_map.get(item.format)}")])
         if path:
             try:
-                effective_quality = 100 if item.convert_only else item.quality
-                
                 # Apply watermark if enabled
                 img_to_save = item.original_pil
                 if item.watermark.enabled:
                     img_to_save = image_utils.apply_watermark(item.original_pil.copy(), item.watermark)
-                
-                image_utils.save_image_to_file(img_to_save, path, item.format, effective_quality)
+
+                image_utils.save_image_to_file(img_to_save, path, item.format, item.effective_quality())
                 messagebox.showinfo("成功", "圖片已儲存！")
             except Exception as e:
                 messagebox.showerror("錯誤", f"儲存失敗: {e}")

@@ -3,7 +3,45 @@ import io
 import requests
 import sys
 import ctypes
+import os
+import re
+import html
+from functools import lru_cache
+from urllib.parse import urljoin
 from typing import Tuple, Optional, Union
+
+
+def _resolve_watermark_position(position: str, width: int, height: int, mark_width: int, mark_height: int, margin: int) -> Tuple[int, int]:
+    if position == "top-left":
+        return margin, margin
+    if position == "top-right":
+        return width - mark_width - margin, margin
+    if position == "bottom-left":
+        return margin, height - mark_height - margin
+    if position == "bottom-right":
+        return width - mark_width - margin, height - mark_height - margin
+    return (width - mark_width) // 2, (height - mark_height) // 2
+
+
+@lru_cache(maxsize=32)
+def _load_truetype_font(font_path: str, font_size: int):
+    return ImageFont.truetype(font_path, font_size)
+
+
+def _get_font_for_watermark(font_size: int):
+    font_path = "arial.ttf"
+    if sys.platform == "win32":
+        font_path = "C:\\Windows\\Fonts\\arial.ttf"
+    try:
+        return _load_truetype_font(font_path, font_size)
+    except IOError:
+        return ImageFont.load_default()
+
+
+@lru_cache(maxsize=16)
+def _load_watermark_image_cached(image_path: str, modified_time: float) -> Image.Image:
+    with Image.open(image_path) as wm_img:
+        return wm_img.convert("RGBA").copy()
 
 def load_image_from_path(path: str) -> Image.Image:
     """從檔案路徑載入圖片"""
@@ -11,12 +49,70 @@ def load_image_from_path(path: str) -> Image.Image:
     path = path.strip('"')
     return Image.open(path)
 
+
+_REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
+
+
+def _extract_image_url_from_html(page_url: str, html_text: str) -> Optional[str]:
+    patterns = [
+        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+        r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image(?::src)?["\']',
+        r'<link[^>]+rel=["\']image_src["\'][^>]+href=["\']([^"\']+)["\']',
+        r'<img[^>]+src=["\']([^"\']+)["\']',
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, html_text, flags=re.IGNORECASE)
+        if not m:
+            continue
+        candidate = html.unescape(m.group(1)).strip()
+        if not candidate:
+            continue
+        candidate = urljoin(page_url, candidate)
+        lower = candidate.lower()
+        if lower.startswith("data:") or lower.startswith("javascript:"):
+            continue
+        return candidate
+    return None
+
+
+def _download_image_bytes(url: str) -> bytes:
+    response = requests.get(url, timeout=10, headers=_REQUEST_HEADERS, allow_redirects=True)
+    response.raise_for_status()
+
+    content_type = (response.headers.get("Content-Type") or "").lower()
+    if content_type.startswith("image/"):
+        return response.content
+
+    if "html" in content_type:
+        html_text = response.text
+        image_url = _extract_image_url_from_html(response.url, html_text)
+        if image_url:
+            image_response = requests.get(
+                image_url,
+                timeout=10,
+                headers={**_REQUEST_HEADERS, "Referer": response.url},
+                allow_redirects=True,
+            )
+            image_response.raise_for_status()
+            image_content_type = (image_response.headers.get("Content-Type") or "").lower()
+            if image_content_type.startswith("image/"):
+                return image_response.content
+
+    raise RuntimeError("網址內容不是可解析的圖片，請提供直接圖片連結或可公開預覽的分享頁。")
+
 def load_image_from_url(url: str) -> Image.Image:
     """從網址下載並載入圖片"""
-    response = requests.get(url, timeout=10)
-    response.raise_for_status()
-    image_data = io.BytesIO(response.content)
-    return Image.open(image_data)
+    image_bytes = _download_image_bytes(url)
+    image_data = io.BytesIO(image_bytes)
+    img = Image.open(image_data)
+    img.load()
+    return img
 
 def get_image_size(img: Image.Image) -> int:
     """估算圖片原始大小 (嘗試以原格式儲存)"""
@@ -198,15 +294,7 @@ def apply_watermark(img: Image.Image, settings) -> Image.Image:
     if settings.text:
         text = settings.text
         font_size = settings.font_size
-        try:
-            # 嘗試載入系統字型，若失敗則使用預設字型
-            # Windows 常見字型路徑
-            font_path = "arial.ttf" 
-            if sys.platform == "win32":
-                font_path = "C:\\Windows\\Fonts\\arial.ttf"
-            font = ImageFont.truetype(font_path, font_size)
-        except IOError:
-            font = ImageFont.load_default()
+        font = _get_font_for_watermark(font_size)
             
         # 計算文字大小
         bbox = draw.textbbox((0, 0), text, font=font)
@@ -214,17 +302,7 @@ def apply_watermark(img: Image.Image, settings) -> Image.Image:
         text_h = bbox[3] - bbox[1]
         
         # 計算位置
-        x, y = 0, 0
-        if settings.position == "top-left":
-            x, y = margin, margin
-        elif settings.position == "top-right":
-            x, y = w - text_w - margin, margin
-        elif settings.position == "bottom-left":
-            x, y = margin, h - text_h - margin
-        elif settings.position == "bottom-right":
-            x, y = w - text_w - margin, h - text_h - margin
-        elif settings.position == "center":
-            x, y = (w - text_w) // 2, (h - text_h) // 2
+        x, y = _resolve_watermark_position(settings.position, w, h, text_w, text_h, margin)
             
         # 繪製文字
         color = hex_to_rgb(settings.text_color)
@@ -232,7 +310,8 @@ def apply_watermark(img: Image.Image, settings) -> Image.Image:
         
     if settings.image_path:
         try:
-            wm_img = Image.open(settings.image_path).convert("RGBA")
+            modified_time = os.path.getmtime(settings.image_path)
+            wm_img = _load_watermark_image_cached(settings.image_path, modified_time).copy()
             
             # 調整浮水印圖片大小
             target_w = int(w * settings.image_scale)
@@ -248,17 +327,7 @@ def apply_watermark(img: Image.Image, settings) -> Image.Image:
             
             # 計算位置
             wm_w, wm_h = wm_img.size
-            x, y = 0, 0
-            if settings.position == "top-left":
-                x, y = margin, margin
-            elif settings.position == "top-right":
-                x, y = w - wm_w - margin, margin
-            elif settings.position == "bottom-left":
-                x, y = margin, h - wm_h - margin
-            elif settings.position == "bottom-right":
-                x, y = w - wm_w - margin, h - wm_h - margin
-            elif settings.position == "center":
-                x, y = (w - wm_w) // 2, (h - wm_h) // 2
+            x, y = _resolve_watermark_position(settings.position, w, h, wm_w, wm_h, margin)
                 
             watermark_layer.paste(wm_img, (int(x), int(y)), wm_img)
             

@@ -91,5 +91,34 @@ class TestImageItem(unittest.TestCase):
         success = self.item.undo_watermark()
         self.assertFalse(success)
 
+    def test_effective_quality(self):
+        self.item.quality = 72
+        self.item.convert_only = False
+        self.assertEqual(self.item.effective_quality(), 72)
+
+        self.item.convert_only = True
+        self.assertEqual(self.item.effective_quality(), 100)
+
+    def test_build_process_key_changes_with_settings(self):
+        key1 = self.item.build_process_key()
+        self.item.quality = 60
+        key2 = self.item.build_process_key()
+        self.assertNotEqual(key1, key2)
+
+        self.item.watermark.text = "wm"
+        key3 = self.item.build_process_key()
+        self.assertNotEqual(key2, key3)
+
+    def test_process_cache_roundtrip(self):
+        key = self.item.build_process_key()
+        img = Image.new('RGB', (6, 6), color='green')
+        self.item.set_cached_process(key, img, 1234)
+
+        cached = self.item.get_cached_process(key)
+        self.assertIsNotNone(cached)
+        cached_img, cached_size = cached
+        self.assertEqual(cached_size, 1234)
+        self.assertEqual(cached_img.size, (6, 6))
+
 if __name__ == '__main__':
     unittest.main()

@@ -46,6 +46,12 @@ class ImageItem:
     watermark: WatermarkSettings = field(default_factory=WatermarkSettings)
     watermark_history: List[WatermarkSettings] = field(default_factory=list)
     action_log: List[str] = field(default_factory=list)
+    process_cache: Dict[Tuple[Any, ...], Tuple[Image.Image, int]] = field(default_factory=dict)
+    last_process_key: Optional[Tuple[Any, ...]] = None
+    canvas_cache_key: Optional[Tuple[Any, ...]] = None
+    canvas_cache_before: Optional[Image.Image] = None
+    canvas_cache_after: Optional[Image.Image] = None
+    preview_source_id: Optional[int] = None
 
     @classmethod
     def from_path(cls, path: str, default_format: str = "JPEG", default_quality: int = 85):
@@ -114,3 +120,44 @@ class ImageItem:
         elif last_action == 'watermark':
             return self.undo_watermark()
         return False
+
+    def effective_quality(self) -> int:
+        return 100 if self.convert_only else self.quality
+
+    def watermark_signature(self) -> Tuple[Any, ...]:
+        wm = self.watermark
+        return (
+            wm.enabled,
+            wm.text,
+            wm.font_size,
+            wm.text_color,
+            wm.text_opacity,
+            wm.image_path,
+            wm.image_scale,
+            wm.image_opacity,
+            wm.position,
+            wm.margin,
+        )
+
+    def build_process_key(self) -> Tuple[Any, ...]:
+        return (
+            id(self.original_pil),
+            self.format,
+            self.effective_quality(),
+            self.watermark_signature(),
+        )
+
+    def get_cached_process(self, key: Tuple[Any, ...]) -> Optional[Tuple[Image.Image, int]]:
+        return self.process_cache.get(key)
+
+    def set_cached_process(self, key: Tuple[Any, ...], image: Image.Image, size: int):
+        self.process_cache[key] = (image.copy(), size)
+        if len(self.process_cache) > 8:
+            oldest = next(iter(self.process_cache))
+            if oldest != key:
+                self.process_cache.pop(oldest, None)
+
+    def clear_canvas_cache(self):
+        self.canvas_cache_key = None
+        self.canvas_cache_before = None
+        self.canvas_cache_after = None
